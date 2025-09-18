@@ -13,14 +13,12 @@
 ## Требования
 - Python 3.10+
 - MySQL 5.7+/8+
- - ffmpeg (для распознавания голосовых: конвертация .oga/.ogg → .wav)
 
 ## Установка
 ```zsh
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-brew install ffmpeg  # macOS (Homebrew)
 ```
 
 ## Переменные окружения
@@ -32,7 +30,8 @@ MYSQL_PORT=3306
 MYSQL_USER=root
 MYSQL_PASSWORD=
 MYSQL_DB=telegram_finance
-OPENAI_API_KEY=ваш_openai_api_key
+# Для голосового ввода (OpenAI)
+OPENAI_API_KEY=sk-...
 ```
 
 Можно быстро создать БД:
@@ -51,7 +50,7 @@ python bot.py
 ## Примечания
 - Денежные суммы хранятся как DECIMAL(10,2).
 - Все даты сохраняются как `created_at` (UTC на уровне приложения). Для простоты используются `CURRENT_TIMESTAMP` из MySQL.
- - Голосовой ввод: отправьте голосовое сообщение — бот распознает речь (OpenAI gpt-audio), затем проанализирует смысл (OpenAI responses API) и предложит добавить найденную транзакцию, попросив подтверждение.
+- Голосовой ввод: отправьте голосовое или аудио-сообщение (OGG/MP3 и т.п.). Нужен `OPENAI_API_KEY`. На macOS ffmpeg обычно не обязателен, мы используем прямую загрузку файла в API; при необходимости установите `brew install ffmpeg`.
 
 ## Структура
 - `bot.py` — точка входа, инициализация бота и БД

@@ -12,7 +12,7 @@ Commands:
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List
 
 from aiogram import Router, F
 from aiogram.filters import Command, CommandObject
@@ -26,13 +26,16 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 
 from db import Database
-import os
-import json
+from voice import (
+    transcribe_file_to_text,
+    parse_transaction_text,
+    Transaction as VoiceTransaction,
+)
+from aiogram.types import Voice as TgVoice, Audio as TgAudio, Document as TgDocument
 import tempfile
-from openai import OpenAI
-import aiohttp
+import os
+import asyncio
 import subprocess
-import shutil
 
 
 router = Router()
@@ -131,7 +134,8 @@ class IncomeStates(StatesGroup):
 
 
 class VoiceConfirmStates(StatesGroup):
-    awaiting_confirmation = State()
+    """States for confirming voice-recognized transactions."""
+    confirm = State()
 
 
 def _parse_add_args(args: Optional[str]) -> Tuple[float, str, Optional[str]]:
@@ -193,10 +197,7 @@ async def cmd_help(message: Message) -> None:
         "/add_income <сумма> <категория> [описание]\n"
         "/balance\n"
         "/stats day|week|month\n"
-        "/delete_last\n\n"
-        "Голосовой ввод:\n"
-        "— Отправьте голосовое сообщение. Бот распознает речь и предложит добавить транзакцию.\n"
-        "— Шаги: 1) транскрибация (gpt-audio), 2) разбор в JSON (responses API), 3) подтверждение добавления.",
+        "/delete_last",
         reply_markup=MAIN_KB,
     )
 
@@ -256,291 +257,6 @@ async def btn_delete_last(message: Message, db: Database) -> None:
 @router.message(F.text == "❓ Помощь")
 async def btn_help(message: Message) -> None:
     await cmd_help(message)
-
-
-# -------- Voice handling ---------
-
-def _openai_client() -> OpenAI:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set")
-    return OpenAI(api_key=api_key)
-
-
-VOICE_JSON_SYSTEM_PROMPT = (
-    "Ты помощник по финансам. На входе текст пользовательского сообщения"
-    " (распознанная речь). Твоя задача — вернуть JSON со структурой строго: "
-    "{\"type\": \"expense|income\", \"amount\": number, \"category\": string, \"description\": string|null}. "
-    "Категория должна быть из списка, если подходит: "
-    "Расходы: [Еда, Транспорт, Жильё, Коммунальные, Связь, Здоровье, Одежда, Развлечения, Подарки, Прочее]; "
-    "Доходы: [Зарплата, Фриланс, Подарки, Продажи, Проценты, Кэшбэк, Инвестиции, Премия, Соцвыплаты, Прочее]. "
-    "Если явной категории нет — выбери 'Прочее'. Сумма — положительное число."
-)
-
-
-async def _download_voice_to_temp(message: Message) -> str:
-    """Download voice file to a temp path and return the file path."""
-
-    voice = message.voice or message.audio or None
-    if voice is None:
-        raise ValueError("Нет голосового файла для обработки")
-
-    file = await message.bot.get_file(voice.file_id)
-    file_url = f"https://api.telegram.org/file/bot{message.bot.token}/{file.file_path}"
-    # Preserve extension if present, default to .oga
-    _, ext = os.path.splitext(file.file_path or "")
-    if not ext:
-        ext = ".oga"
-    fd, tmp_path = tempfile.mkstemp(suffix=ext)
-    os.close(fd)
-    async with aiohttp.ClientSession() as session:
-        async with session.get(file_url) as resp:
-            resp.raise_for_status()
-            with open(tmp_path, "wb") as f:
-                f.write(await resp.read())
-    return tmp_path
-
-
-def _convert_to_wav(src_path: str) -> str:
-    """Convert audio file to WAV using ffmpeg. Returns new file path."""
-
-    if not shutil.which("ffmpeg"):
-        raise RuntimeError(
-            "ffmpeg не найден. Установите ffmpeg (brew install ffmpeg) и повторите."
-        )
-    fd, dst_path = tempfile.mkstemp(suffix=".wav")
-    os.close(fd)
-    # Convert to mono 16k PCM for better ASR
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        src_path,
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        dst_path,
-    ]
-    try:
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except subprocess.CalledProcessError as e:
-        try:
-            os.remove(dst_path)
-        except Exception:
-            pass
-        raise RuntimeError(f"Ошибка конвертации аудио: {e.stderr.decode(errors='ignore')}")
-    return dst_path
-
-
-async def _transcribe_audio(audio_path: str) -> str:
-    """Use OpenAI gpt-audio model to get transcription text."""
-
-    client = _openai_client()
-    with open(audio_path, "rb") as f:
-        try:
-            transcript = client.audio.transcriptions.create(
-                model="gpt-4o-transcribe",  # gpt-audio family (если доступно)
-                file=f,
-                response_format="text",
-            )
-            return transcript
-        except Exception:
-            f.seek(0)
-            # Fallback на whisper-1, если gpt-audio недоступна
-            transcript = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                response_format="text",
-            )
-            return transcript
-
-
-async def _parse_finance_json(text: str) -> Dict[str, Any]:
-    """Use responses API (e.g., GPT-5-nano) to extract strict JSON."""
-
-    client = _openai_client()
-    # We constrain the model to output JSON only
-    resp = client.responses.create(
-        model="gpt-4o-mini",  # placeholder for GPT-5 nano if available in your env
-        input=[
-            {
-                "role": "system",
-                "content": VOICE_JSON_SYSTEM_PROMPT,
-            },
-            {
-                "role": "user",
-                "content": text,
-            },
-        ],
-        #response_format={"type": "json_object"},
-    )
-    content = resp.output[0].content[0].text if hasattr(resp, "output") else json.dumps({})
-    # Fallback: newer SDKs often provide resp.output_text for json
-    try:
-        data = json.loads(getattr(resp, "output_text", content))
-    except Exception:
-        data = {}
-    return data
-
-
-def _validate_voice_json(data: Dict[str, Any]) -> Optional[str]:
-    """Validate parsed JSON, return error message or None if ok."""
-
-    if not isinstance(data, dict):
-        return "Неверный формат данных."
-    tx_type_raw = str(data.get("type") or "").strip().lower()
-    tx_type: Optional[str] = None
-    if tx_type_raw in {"expense", "income"}:
-        tx_type = tx_type_raw
-    else:
-        income_syn = {"доход", "income", "прибыль", "зачисление", "зарплата", "поступление"}
-        expense_syn = {"расход", "expense", "трата", "покупка", "списание", "оплата"}
-        if tx_type_raw in income_syn:
-            tx_type = "income"
-        elif tx_type_raw in expense_syn:
-            tx_type = "expense"
-    # Infer from category if still unknown
-    category_peek = str(data.get("category") or "").strip()
-    if not tx_type and category_peek:
-        if category_peek in INCOME_CATEGORIES:
-            tx_type = "income"
-        elif category_peek in EXPENSE_CATEGORIES:
-            tx_type = "expense"
-    if not tx_type:
-        return "Тип операции должен быть 'expense' или 'income'."
-    data["type"] = tx_type
-    try:
-        amount = float(data.get("amount"))
-    except Exception:
-        return "Сумма должна быть числом."
-    if amount <= 0:
-        return "Сумма должна быть положительной."
-    category = str(data.get("category") or "").strip()
-    valid_cats = EXPENSE_CATEGORIES if tx_type == "expense" else INCOME_CATEGORIES
-    if category not in valid_cats:
-        # map common synonyms or default to 'Прочее'
-        category = "Прочее"
-        data["category"] = category
-    # normalize description
-    desc = data.get("description")
-    if desc is not None and not isinstance(desc, str):
-        data["description"] = str(desc)
-    return None
-
-
-@router.message(F.voice | F.audio)
-async def handle_voice(message: Message, state: FSMContext, db: Database) -> None:
-    """Handle incoming voice/audio message: transcribe -> parse -> confirm."""
-
-    # Step 1: download and transcribe
-    try:
-        tmp_path = await _download_voice_to_temp(message)
-    except Exception as e:
-        await message.answer(f"Не удалось скачать голосовое: {e}", reply_markup=MAIN_KB)
-        return
-    try:
-        # Convert if necessary (e.g., .oga/.ogg -> .wav)
-        _, ext = os.path.splitext(tmp_path)
-        wav_path = None
-        try:
-            if ext.lower() in {".oga", ".ogg", ".opus"}:
-                wav_path = _convert_to_wav(tmp_path)
-                text = await _transcribe_audio(wav_path)
-            else:
-                text = await _transcribe_audio(tmp_path)
-        finally:
-            if wav_path and os.path.exists(wav_path):
-                try:
-                    os.remove(wav_path)
-                except Exception:
-                    pass
-    except Exception as e:
-        await message.answer(f"Ошибка распознавания речи: {e}", reply_markup=MAIN_KB)
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
-        return
-    finally:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
-
-    # Step 2: parse into JSON
-    try:
-        data = await _parse_finance_json(text)
-    except Exception as e:
-        await message.answer(f"Ошибка анализа текста: {e}", reply_markup=MAIN_KB)
-        return
-
-    err = _validate_voice_json(data)
-    if err:
-        await message.answer(f"Понял: {text}\n\nНо возникла ошибка: {err}", reply_markup=MAIN_KB)
-        return
-
-    # Step 3: confirmation
-    tx_type = data.get("type")
-    amount = float(data.get("amount"))
-    category = str(data.get("category"))
-    description = data.get("description")
-    await state.update_data(voice_tx={
-        "type": tx_type,
-        "amount": amount,
-        "category": category,
-        "description": description,
-    })
-    await state.set_state(VoiceConfirmStates.awaiting_confirmation)
-    lines = [
-        "Это верно?",
-        f"Тип: {'Расход' if tx_type=='expense' else 'Доход'}",
-        f"Сумма: {amount:.2f}",
-        f"Категория: {category}",
-    ]
-    if description:
-        lines.append(f"Описание: {description}")
-    await message.answer("\n".join(lines), reply_markup=YES_NO_KB)
-
-
-@router.message(VoiceConfirmStates.awaiting_confirmation)
-async def voice_confirm(message: Message, state: FSMContext, db: Database) -> None:
-    answer = (message.text or "").strip().lower()
-    if answer == "отмена":
-        await state.clear()
-        await message.answer("Отменено.", reply_markup=MAIN_KB)
-        return
-    if answer not in {"да", "нет"}:
-        await message.answer("Пожалуйста, выберите 'Да' или 'Нет'.", reply_markup=YES_NO_KB)
-        return
-    if answer == "нет":
-        await state.clear()
-        await message.answer("Хорошо, не добавляю.", reply_markup=MAIN_KB)
-        return
-
-    data = await state.get_data()
-    voice_tx = data.get("voice_tx", {})
-    tx_type = voice_tx.get("type")
-    amount = float(voice_tx.get("amount", 0))
-    category = str(voice_tx.get("category", "Прочее"))
-    description = voice_tx.get("description")
-
-    user = message.from_user
-    assert user is not None
-    user_id = await db.ensure_user(user.id, (user.full_name or "").strip() or str(user.id))
-    await db.add_transaction(
-        user_id=user_id,
-        tx_type=tx_type,
-        amount=amount,
-        category=category,
-        description=description,
-    )
-    await state.clear()
-    sign = "+" if tx_type == "income" else "-"
-    await message.answer(
-        f"Добавлено: {sign}{amount:.2f} ({category}).",
-        reply_markup=MAIN_KB,
-    )
 
 
 @router.message(Command("add_expense"))
@@ -863,6 +579,165 @@ async def _finalize_income(
         reply_markup=MAIN_KB,
     )
 
+
+# -------- Voice input ---------
+
+async def _download_file(message: Message, file_id: str) -> str:
+    """Download Telegram file, convert to WAV if needed, and return path."""
+
+    bot = message.bot
+    file = await bot.get_file(file_id)
+
+    # исходное расширение (по пути телеги)
+    ext = os.path.splitext(file.file_path or "")[1].lower() or ".oga"
+
+    # сохраняем исходный файл во временный путь
+    fd, src_path = tempfile.mkstemp(suffix=ext)
+    os.close(fd)
+    await bot.download_file(file.file_path, destination=src_path)
+
+    # если это ogg/opus/oga — конвертируем в wav 16k mono
+    if ext in {".oga", ".ogg", ".opus"}:
+        fd, wav_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+
+        # ffmpeg командой в фоне
+        cmd = [
+            "ffmpeg",
+            "-y",                # перезаписать если есть
+            "-i", src_path,      # входной файл
+            "-ar", "16000",      # sample rate 16kHz
+            "-ac", "1",          # моно
+            wav_path,
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+
+        # можно удалить оригинал
+        try:
+            os.remove(src_path)
+        except OSError:
+            pass
+
+        return wav_path
+
+    # если уже поддерживаемое расширение — возвращаем как есть
+    return src_path
+
+
+@router.message(F.voice | F.audio)
+async def on_voice_or_audio(message: Message, db: Database, state: FSMContext) -> None:
+    """Handle voice or audio message: transcribe and parse transaction."""
+
+    file_id = None
+    if message.voice:
+        file_id = message.voice.file_id
+    elif message.audio:
+        file_id = message.audio.file_id
+    else:
+        await message.answer("Не удалось распознать голосовое сообщение.", reply_markup=MAIN_KB)
+        return
+
+    await message.answer("Обрабатываю голосовое сообщение…")
+    try:
+        path = await _download_file(message, file_id)
+        text = transcribe_file_to_text(path)
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+    if not text:
+        await message.answer(
+            "Не удалось распознать речь. Попробуйте ещё раз или используйте команды.",
+            reply_markup=MAIN_KB,
+        )
+        return
+
+    vt = parse_transaction_text(text)
+    if vt is None:
+        await message.answer(
+            "Не удалось понять транзакцию из текста. Скажите, например: 'расход 200 еда обед'",
+            reply_markup=MAIN_KB,
+        )
+        return
+
+    # Сохраняем данные транзакции для подтверждения
+    await state.set_state(VoiceConfirmStates.confirm)
+    await state.update_data(
+        amount=float(vt.sum),
+        category=vt.category,
+        tx_type=vt.type,
+        description=vt.description,
+        original_text=text,
+    )
+    
+    sign = "+" if vt.type == "income" else "-"
+    tx_type_ru = "доход" if vt.type == "income" else "расход"
+    desc_text = f", описание: {vt.description}" if vt.description else ""
+    
+    await message.answer(
+        f"Распознанная транзакция:\n"
+        f"{tx_type_ru.capitalize()}: {sign}{vt.sum:.2f}\n"
+        f"Категория: {vt.category}{desc_text}\n"
+        f"Текст: \"{text}\"\n\n"
+        f"Сохранить эту транзакцию?",
+        reply_markup=YES_NO_KB,
+    )
+
+
+@router.message(VoiceConfirmStates.confirm)
+async def voice_confirm_transaction(message: Message, state: FSMContext, db: Database) -> None:
+    """Handle confirmation of voice-recognized transaction."""
+    
+    answer = (message.text or "").strip().lower()
+    data = await state.get_data()
+    
+    if answer == "отмена":
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=MAIN_KB)
+        return
+    
+    if answer == "да":
+        user = message.from_user
+        assert user is not None
+        user_id = await db.ensure_user(user.id, (user.full_name or "").strip() or str(user.id))
+        
+        amount = data["amount"]
+        category = data["category"]
+        tx_type = data["tx_type"]
+        description = data.get("description")
+        
+        await db.add_transaction(
+            user_id=user_id,
+            tx_type=tx_type,
+            amount=amount,
+            category=category,
+            description=description,
+        )
+        
+        sign = "+" if tx_type == "income" else "-"
+        await state.clear()
+        await message.answer(
+            f"Транзакция сохранена: {sign}{amount:.2f} '{category}'",
+            reply_markup=MAIN_KB,
+        )
+        return
+    
+    if answer == "нет":
+        await state.clear()
+        await message.answer(
+            "Транзакция отменена. Попробуйте записать голосовое сообщение ещё раз или используйте команды.",
+            reply_markup=MAIN_KB,
+        )
+        return
+    
+    await message.answer("Пожалуйста, выберите 'Да' или 'Нет'.", reply_markup=YES_NO_KB)
 
 
 __all__ = ["router"]
